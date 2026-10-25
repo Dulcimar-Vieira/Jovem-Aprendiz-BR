@@ -253,7 +253,7 @@ def main():
     }
 
     try:
-        with gzip.open(io.BytesIO(response.content), "rt", encoding="utf-8") as feed:
+        with gzip.open(io.BytesIO(response.content), "rb") as feed:
             for _, elem in ET.iterparse(feed, events=("end",)):
                 if elem.tag.split("}")[-1] != "job":
                     continue
