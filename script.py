@@ -10,6 +10,7 @@ import re
 import sys
 import unicodedata
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -20,6 +21,7 @@ OUTPUT_FOLDER = Path("json_parts")
 MAX_JOBS = 1000
 MAX_SALARY_BRL = 10000.0
 REQUEST_TIMEOUT = 90
+STATE_FILE = Path("daily_jobs_state.json")
 
 # Termos são avaliados sem acentos, em título, tipo de vaga e descrição.
 TARGET_RE = re.compile(
@@ -162,27 +164,86 @@ def extract_salary(structured_salary, description):
     return ""
 
 
+def load_publication_state():
+    """
+    Carrega as datas estáveis da execução anterior.
+    Se o arquivo existir, mas estiver inválido, interrompe o processo para
+    evitar zerar o histórico e renovar indevidamente a validade das vagas.
+    """
+    if not STATE_FILE.exists():
+        return {"date": "", "jobs": {}}
+
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERRO ao ler {STATE_FILE}: {exc}")
+
+    if not isinstance(state, dict) or not isinstance(state.get("jobs"), dict):
+        raise SystemExit(
+            f"ERRO: {STATE_FILE} não possui a estrutura esperada; "
+            "o processamento foi interrompido para preservar as datas."
+        )
+
+    return state
+
+
+def save_publication_state(jobs_state, run_started):
+    """Grava atomicamente apenas as vagas presentes no feed desta execução."""
+    state = {
+        "date": run_started.date().isoformat(),
+        "jobs": jobs_state,
+    }
+    temp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+
+    with temp.open("w", encoding="utf-8") as file:
+        json.dump(state, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+
+    temp.replace(STATE_FILE)
+
+
 def parse_date(raw):
     if not raw:
         return None
-    value = raw.strip()
+
+    value = str(raw).strip()
+    if not value:
+        return None
+
     for fmt in (
         "%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d",
         "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S%z",
     ):
         try:
-            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+            parsed = datetime.strptime(value, fmt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
         except ValueError:
             pass
+
+    # Alguns feeds publicam datas no padrão RFC 2822, por exemplo:
+    # Tue, 03 Nov 2026 12:00:00 +0000.
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        pass
+
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
 
 
-def build_job(elem):
+def build_job(elem, previous_state_jobs, run_started):
     title = text_at(elem, "title")
     description_raw = text_at(elem, "description")
     company = text_at(elem, "company/name") or "Confidencial"
@@ -194,9 +255,19 @@ def build_job(elem):
     city = text_at(location, "city") if location is not None else text_at(elem, "city")
     state = text_at(location, "state") if location is not None else text_at(elem, "state")
 
-    pub_raw = text_at(elem, "pubdate") or text_at(elem, "pubDate")
-    updated_raw = text_at(elem, "updated")
-    pub_date = parse_date(pub_raw) or parse_date(updated_raw)
+    # Usa a data original da fonte quando disponível. Aceita nomes comuns
+    # de campos e formatos ISO/RFC 2822.
+    pub_raw = (
+        text_at(elem, "pubdate")
+        or text_at(elem, "pubDate")
+        or text_at(elem, "datePosted")
+        or text_at(elem, "date_posted")
+        or text_at(elem, "published")
+        or text_at(elem, "publishedAt")
+        or text_at(elem, "created")
+    )
+    updated_raw = text_at(elem, "updated") or text_at(elem, "updatedAt")
+    source_pub_date = parse_date(pub_raw) or parse_date(updated_raw)
 
     if not title or not url or not city or not state:
         return None
@@ -209,8 +280,26 @@ def build_job(elem):
     if not salary or salary_exceeds_limit(salary, description_raw):
         return None
 
-    published = pub_date.isoformat() if pub_date else ""
     url_key = url.strip().rstrip("/")
+
+    # Sem data fornecida pela fonte, reutiliza a data salva na primeira
+    # identificação da URL. Só uma URL realmente nova recebe a data desta
+    # primeira execução. Assim, reprocessar o mesmo feed não prorroga 60 dias.
+    saved_entry = previous_state_jobs.get(url_key)
+    if isinstance(saved_entry, dict):
+        saved_raw = (
+            saved_entry.get("data_publicacao")
+            or saved_entry.get("first_seen_at")
+        )
+    elif isinstance(saved_entry, str):
+        saved_raw = saved_entry
+    else:
+        saved_raw = ""
+
+    saved_pub_date = parse_date(saved_raw)
+    effective_pub_date = source_pub_date or saved_pub_date or run_started
+    published = effective_pub_date.astimezone(timezone.utc).isoformat(timespec="seconds")
+
     unique_id = hashlib.sha256(
         f"{normalize(title)}|{normalize(company)}|{normalize(city)}|{url_key}".encode("utf-8")
     ).hexdigest()
@@ -227,7 +316,7 @@ def build_job(elem):
         "url": url,
         "data_publicacao": published,
         "origem": "WhatJobs",
-    }, url_key, pub_date
+    }, url_key, effective_pub_date
 
 
 def main():
@@ -241,6 +330,10 @@ def main():
         response.raise_for_status()
     except requests.RequestException as exc:
         raise SystemExit(f"ERRO ao baixar o feed: {exc}")
+
+    state_data = load_publication_state()
+    previous_state_jobs = state_data.get("jobs", {})
+    run_started = datetime.now(timezone.utc)
 
     candidates = {}
     counts = {
@@ -259,7 +352,7 @@ def main():
                     continue
 
                 counts["xml_lidas"] += 1
-                built = build_job(elem)
+                built = build_job(elem, previous_state_jobs, run_started)
                 if built is None:
                     title = text_at(elem, "title")
                     description = text_at(elem, "description")
@@ -292,7 +385,8 @@ def main():
         key=lambda item: item[1] or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    jobs = [job for job, _ in ordered[:MAX_JOBS]]
+    selected = ordered[:MAX_JOBS]
+    jobs = [job for job, _ in selected]
 
     if not jobs:
         raise SystemExit("ERRO: não há vagas válidas; os arquivos existentes foram preservados.")
@@ -308,6 +402,18 @@ def main():
         json.dump(jobs, file, ensure_ascii=False, indent=2)
         file.write("\n")
     temp.replace(output)
+
+    # Mantém no estado somente as vagas presentes no arquivo gerado.
+    # Para cada URL, preserva a data original ou a primeira identificação.
+    run_seen_at = run_started.isoformat(timespec="seconds")
+    current_state_jobs = {
+        job["url"].strip().rstrip("/"): {
+            "data_publicacao": job["data_publicacao"],
+            "last_seen_at": run_seen_at,
+        }
+        for job, _ in selected
+    }
+    save_publication_state(current_state_jobs, run_started)
 
     print("Resumo:")
     for name, value in counts.items():
