@@ -277,8 +277,9 @@ def build_job(elem, previous_state_jobs, run_started):
         return None
 
     salary = extract_salary(structured_salary, description_raw)
-    if not salary or salary_exceeds_limit(salary, description_raw):
+    if salary_exceeds_limit(salary, description_raw):
         return None
+    salary_value = salary if has_real_salary(salary) else "A combinar"
 
     url_key = url.strip().rstrip("/")
 
@@ -309,7 +310,7 @@ def build_job(elem, previous_state_jobs, run_started):
         "title": title,
         "description": clean_html(description_raw),
         "company": company,
-        "salary": salary,
+        "salary": salary_value,
         "city": city,
         "state": state,
         "tipo": job_type or "Não informado",
@@ -339,7 +340,8 @@ def main():
     counts = {
         "xml_lidas": 0,
         "fora_das_categorias": 0,
-        "sem_salario_valido": 0,
+        "com_salario": 0,
+        "sem_salario": 0,
         "salario_acima_de_10000": 0,
         "duplicadas": 0,
         "dados_obrigatorios_ausentes": 0,
@@ -363,29 +365,53 @@ def main():
                         counts["fora_das_categorias"] += 1
                     else:
                         salary = extract_salary(text_at(elem, "salary"), description)
-                        if not salary:
-                            counts["sem_salario_valido"] += 1
-                        else:
+                        if salary_exceeds_limit(salary, description):
                             counts["salario_acima_de_10000"] += 1
                     elem.clear()
                     continue
 
                 job, url_key, pub_date = built
-                if url_key in candidates:
+                existing = candidates.get(url_key)
+                if existing is not None:
                     counts["duplicadas"] += 1
+                    existing_has_salary = has_real_salary(existing[0].get("salary", ""))
+                    incoming_has_salary = has_real_salary(job.get("salary", ""))
+                    # Em caso de URL duplicada, conserva a versão com salário.
+                    if incoming_has_salary and not existing_has_salary:
+                        candidates[url_key] = (job, pub_date)
                     elem.clear()
                     continue
+
                 candidates[url_key] = (job, pub_date)
                 elem.clear()
     except (OSError, EOFError, ET.ParseError) as exc:
         raise SystemExit(f"ERRO ao interpretar o XML compactado: {exc}")
 
-    ordered = sorted(
-        candidates.values(),
+    counts["com_salario"] = sum(
+        1 for job, _ in candidates.values()
+        if has_real_salary(job.get("salary", ""))
+    )
+    counts["sem_salario"] = len(candidates) - counts["com_salario"]
+
+    # Primeiro seleciona todas as vagas com salário; depois completa
+    # a cota de até 1.000 com vagas sem salário, marcadas como "A combinar".
+    with_salary = sorted(
+        (
+            item for item in candidates.values()
+            if has_real_salary(item[0].get("salary", ""))
+        ),
         key=lambda item: item[1] or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    selected = ordered[:MAX_JOBS]
+    without_salary = sorted(
+        (
+            item for item in candidates.values()
+            if not has_real_salary(item[0].get("salary", ""))
+        ),
+        key=lambda item: item[1] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    selected = (with_salary + without_salary)[:MAX_JOBS]
     jobs = [job for job, _ in selected]
 
     if not jobs:
@@ -418,7 +444,12 @@ def main():
     print("Resumo:")
     for name, value in counts.items():
         print(f"  {name}: {value}")
-    print(f"  vagas selecionadas: {len(jobs)}")
+    selected_with_salary = sum(
+        1 for job in jobs if has_real_salary(job.get("salary", ""))
+    )
+    print(f"  selecionadas com salário: {selected_with_salary}")
+    print(f"  selecionadas A combinar: {len(jobs) - selected_with_salary}")
+    print(f"  total selecionado: {len(jobs)}")
     print(f"Arquivo gerado: {output}")
 
 
